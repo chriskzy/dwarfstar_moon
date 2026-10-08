@@ -7,6 +7,7 @@
 #include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
 #include "ds4_web.h"
+#include "ds4_d1.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -91,6 +92,12 @@ typedef struct {
     const char *chdir_path;
     bool non_interactive;
     bool edit_upto;
+    /* Optional decision-model server (--d1): asked before each bash command
+     * whether it looks destructive; at or above d1_threshold the user must
+     * approve it. */
+    bool d1_enabled;
+    ds4_d1_endpoint d1;
+    float d1_threshold;
 } agent_config;
 
 typedef enum {
@@ -178,6 +185,8 @@ typedef struct {
     bool web_approval_result;
     char web_approval_message[256];
     char web_approval_error[160];
+    char web_approval_what[64];     /* subject of the pending approval */
+    bool d1_unavailable_reported;
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -726,6 +735,7 @@ static agent_config parse_options(int argc, char **argv) {
             .min_p = DS4_DEFAULT_MIN_P,
             .think_mode = DS4_THINK_HIGH,
         },
+        .d1_threshold = 0.5f,
     };
 
     bool steering_scale_set = false;
@@ -816,6 +826,16 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "--edit-upto")) {
             c.edit_upto = true;
+        } else if (!strcmp(arg, "--d1")) {
+            char err[256] = {0};
+            if (!ds4_d1_parse_endpoint(need_arg(&i, argc, argv, arg), &c.d1,
+                                       err, sizeof(err))) {
+                fprintf(stderr, "ds4-agent: %s\n", err);
+                exit(2);
+            }
+            c.d1_enabled = true;
+        } else if (!strcmp(arg, "--d1-threshold")) {
+            c.d1_threshold = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -5168,22 +5188,19 @@ static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) 
     free(heap);
 }
 
-static int agent_web_confirm(void *privdata, const char *message,
-                             char *err, size_t err_len) {
-    agent_worker *w = privdata;
-    if (!w || w->cfg->non_interactive) {
-        snprintf(err, err_len,
-                 "visible Chrome browser startup requires interactive approval");
-        return 0;
-    }
-
+/* Ask the UI thread for a yes/no approval and block the worker until it
+ * answers.  `what` names the action in denial and timeout messages. */
+static int agent_request_approval(agent_worker *w, const char *what,
+                                  const char *message,
+                                  char *err, size_t err_len) {
     pthread_mutex_lock(&w->mu);
     w->web_approval_pending = true;
     w->web_approval_answered = false;
     w->web_approval_result = false;
     w->web_approval_error[0] = '\0';
+    snprintf(w->web_approval_what, sizeof(w->web_approval_what), "%s", what);
     snprintf(w->web_approval_message, sizeof(w->web_approval_message),
-             "%s", message ? message : "Start visible Chrome browser? (y/n) ");
+             "%s", message);
     agent_wake_locked(w);
     while (!w->stop && !w->interrupt && !w->web_approval_answered)
         pthread_cond_wait(&w->cond, &w->mu);
@@ -5195,12 +5212,26 @@ static int agent_web_confirm(void *privdata, const char *message,
                  "interrupted");
     }
     if (!ok) {
-        snprintf(err, err_len, "%s",
-                 w->web_approval_error[0] ? w->web_approval_error :
-                 "user denied Chrome browser start");
+        if (w->web_approval_error[0])
+            snprintf(err, err_len, "%s", w->web_approval_error);
+        else
+            snprintf(err, err_len, "user denied %s", what);
     }
     pthread_mutex_unlock(&w->mu);
     return ok ? 1 : 0;
+}
+
+static int agent_web_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len) {
+    agent_worker *w = privdata;
+    if (!w || w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "visible Chrome browser startup requires interactive approval");
+        return 0;
+    }
+    return agent_request_approval(w, "Chrome browser start",
+                                  message ? message : "Start visible Chrome browser? (y/n) ",
+                                  err, err_len);
 }
 
 static void agent_web_log(void *privdata, const char *message) {
@@ -5226,14 +5257,14 @@ static bool worker_take_web_approval_request(agent_worker *w,
 }
 
 static void worker_answer_web_approval(agent_worker *w, bool allow,
-                                       const char *deny_error) {
+                                       bool timed_out) {
     pthread_mutex_lock(&w->mu);
     w->web_approval_result = allow;
     w->web_approval_answered = true;
     if (!allow)
         snprintf(w->web_approval_error, sizeof(w->web_approval_error),
-                 "%s", deny_error && deny_error[0] ? deny_error :
-                 "user denied Chrome browser start");
+                 timed_out ? "%s approval timed out" : "user denied %s",
+                 w->web_approval_what);
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -9448,6 +9479,68 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_puts(obs, meta);
 }
 
+/* d1 safety gate.  The decision model sees only the working directory and
+ * the command, never the transcript, and answers one calibrated yes/no
+ * question in a single forward pass.  When the server is unreachable the gate
+ * fails open: without --d1 commands run unchecked too, so an outage must not
+ * be worse than not configuring it. */
+#define AGENT_D1_TIMEOUT_MS 2000
+
+static const char agent_d1_bash_question[] =
+    "Could running this shell command cause irreversible damage or reach outside "
+    "the working directory, for example by deleting or overwriting data, "
+    "rewriting git history, changing system configuration, or sending files or "
+    "secrets over the network?";
+
+static char *agent_d1_bash_state(const char *cmd) {
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "(unknown)");
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Working directory: ");
+    agent_buf_puts(&b, cwd);
+    agent_buf_puts(&b, "\nShell command:\n");
+    agent_buf_puts(&b, cmd);
+    agent_buf_puts(&b, "\n");
+    return agent_buf_take(&b);
+}
+
+/* Returns true when the command may run; otherwise err explains why not. */
+static bool agent_d1_bash_gate(agent_worker *w, const char *cmd,
+                               char *err, size_t err_len) {
+    if (!w->cfg->d1_enabled) return true;
+    char *state = agent_d1_bash_state(cmd);
+    char d1_err[256] = {0};
+    double p = 0;
+    bool asked = ds4_d1_noul(&w->cfg->d1, state, agent_d1_bash_question,
+                             AGENT_D1_TIMEOUT_MS, &p, d1_err, sizeof(d1_err));
+    free(state);
+    if (!asked) {
+        agent_trace(w, "d1 gate: unavailable: %s", d1_err);
+        if (!w->d1_unavailable_reported) {
+            agent_publishf_system_status(w,
+                "d1 gate unavailable (%s); bash commands run unchecked", d1_err);
+            w->d1_unavailable_reported = true;
+        }
+        return true;
+    }
+    w->d1_unavailable_reported = false;
+    agent_trace(w, "d1 gate: p=%.4f threshold=%.2f", p, w->cfg->d1_threshold);
+    if (p < w->cfg->d1_threshold) return true;
+
+    if (w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "d1 rated this command risky (p=%.2f) and non-interactive mode "
+                 "cannot ask for approval", p);
+        return false;
+    }
+    char message[256];
+    snprintf(message, sizeof(message),
+             "d1 rates this command risky (p=%.2f): %.140s%s\nRun it? (y/n) ",
+             p, cmd, strlen(cmd) > 140 ? "..." : "");
+    return agent_request_approval(w, "risky bash command", message,
+                                  err, err_len) != 0;
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -9467,6 +9560,13 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
+        char gate_err[256] = {0};
+        if (!agent_d1_bash_gate(w, cmd, gate_err, sizeof(gate_err))) {
+            agent_buf_puts(&result, "Tool error: bash command not run: ");
+            agent_buf_puts(&result, gate_err);
+            agent_buf_puts(&result, "\n");
+            return agent_buf_take(&result);
+        }
         int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
                                               60, 1, 3600);
@@ -13181,8 +13281,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             bool allow = agent_prompt_yes_no_ex(web_approval_msg,
                                                 &approval_opts,
                                                 &approval_timed_out);
-            worker_answer_web_approval(&worker, allow,
-                approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+            worker_answer_web_approval(&worker, allow, approval_timed_out);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;

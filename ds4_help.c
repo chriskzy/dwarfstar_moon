@@ -319,6 +319,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--non-interactive", "Run without TUI. With an initial prompt: one turn; otherwise: repeated stdin prompts.");
     opt(fp, c, "--raw-prompt", "Non-interactive initial prompt only: omit agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
+    opt(fp, c, "--d1 ADDR", "Decision-model server (PORT, HOST:PORT or unix:/path) asked before each bash command.");
+    opt(fp, c, "--d1-threshold P", "Ask for approval when d1 rates a command risky with probability >= P. Default: 0.5");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");

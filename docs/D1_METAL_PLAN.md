@@ -322,6 +322,19 @@ There are two tracks. Track A does not depend on Track B.
 
 ### Track A: integration against llama-server (start immediately)
 
+**Status: A1 implemented.** `ds4_d1.{c,h}` is the `/v1/systemone` client
+(TCP or unix socket, bounded timeout, chunked replies). `ds4-agent --d1 ADDR`
+asks d1 one noul question before each `bash` command, with only the working
+directory and the command as state. At or above `--d1-threshold` (default 0.5)
+the user must approve the command; non-interactive runs refuse it. If the
+server is unreachable the gate fails open and says so once. Tests:
+`tests/test_d1_client` and `test_d1_bash_gate` in `ds4_agent_test`.
+
+```sh
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8080
+./ds4-agent --d1 8080
+```
+
 - **A1.** Add `ds4_d1_client.c`, `--d1 ADDR`, one harness hook (the pre-tool
   safety gate), and the fake-server tests.
   - **Exit:** `make` and `make test` (agent and server unit tests) pass, and

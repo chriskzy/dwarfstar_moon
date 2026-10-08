@@ -2,6 +2,8 @@
 #define DS4_AGENT_TEST_NO_MAIN
 #include "../ds4_agent.c"
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -931,6 +933,139 @@ static void test_v41_tool_syntax(void) {
     }
 }
 
+/* d1 gate: a fake /v1/systemone server on a unix socket answers each bash
+ * command with a fixed noul probability. */
+typedef struct {
+    int listen_fd;
+    const char *noul;
+    int served;
+    int max_served;
+    char last_request[4096];
+} test_d1_server;
+
+static void *test_d1_server_main(void *arg) {
+    test_d1_server *s = arg;
+    while (s->served < s->max_served) {
+        int fd = accept(s->listen_fd, NULL, NULL);
+        if (fd < 0) return NULL;
+        size_t len = 0;
+        for (;;) {
+            ssize_t n = recv(fd, s->last_request + len,
+                             sizeof(s->last_request) - 1 - len, 0);
+            if (n <= 0) break;
+            len += (size_t)n;
+            s->last_request[len] = '\0';
+            const char *body = strstr(s->last_request, "\r\n\r\n");
+            const char *cl = strstr(s->last_request, "Content-Length: ");
+            if (body && cl && strlen(body + 4) >= (size_t)atoi(cl + 16)) break;
+        }
+        char reply[256];
+        snprintf(reply, sizeof(reply),
+                 "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+                 "{\"answers\":{\"q\":{\"type\":\"noul\",\"noul\":%s}}}", s->noul);
+        s->served++;
+        (void)!write(fd, reply, strlen(reply));
+        close(fd);
+    }
+    return NULL;
+}
+
+typedef struct {
+    agent_worker *w;
+    bool allow;
+    char seen[256];
+} test_d1_approver;
+
+/* Stand-in for the UI thread: answer the first approval request. */
+static void *test_d1_approver_main(void *arg) {
+    test_d1_approver *a = arg;
+    for (int i = 0; i < 2000; i++) {
+        if (worker_take_web_approval_request(a->w, a->seen, sizeof(a->seen))) {
+            worker_answer_web_approval(a->w, a->allow, false);
+            return NULL;
+        }
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void test_d1_bash_gate(void) {
+    char *options[] = {"ds4-agent", "--d1", "unix:/tmp/d1.sock", "--d1-threshold", "0.7"};
+    agent_config parsed = parse_options(5, options);
+    AGENT_TEST_ASSERT(parsed.d1_enabled && !strcmp(parsed.d1.unix_path, "/tmp/d1.sock"));
+    AGENT_TEST_ASSERT(parsed.d1_threshold == 0.7f);
+
+    char dir[] = "/tmp/ds4-agent-d1-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char sock[96], marker[PATH_MAX], cmd[PATH_MAX + 16], spec[128];
+    snprintf(sock, sizeof(sock), "%s/d1.sock", dir);
+    snprintf(marker, sizeof(marker), "%s/ran", dir);
+    snprintf(cmd, sizeof(cmd), "touch %s", marker);
+    snprintf(spec, sizeof(spec), "unix:%s", sock);
+
+    test_d1_server srv = {.noul = "0.93", .max_served = 4};
+    srv.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock);
+    AGENT_TEST_ASSERT(bind(srv.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    AGENT_TEST_ASSERT(listen(srv.listen_fd, 4) == 0);
+    pthread_t server_thread;
+    pthread_create(&server_thread, NULL, test_d1_server_main, &srv);
+
+    agent_config cfg = {.non_interactive = true, .d1_enabled = true, .d1_threshold = 0.5f};
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(ds4_d1_parse_endpoint(spec, &cfg.d1, err, sizeof(err)));
+    agent_worker w = {.cfg = &cfg, .wake_fd = {-1, -1}};
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cond, NULL);
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+
+    /* Risky and non-interactive: the command must not run. */
+    agent_tool_call call = {.name = xstrdup("bash")};
+    test_tool_arg(&call, "command", cmd);
+    char *res = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(!strncmp(res, "Tool error: bash command not run: d1 rated", 42));
+    AGENT_TEST_ASSERT(access(marker, F_OK) != 0);
+    AGENT_TEST_ASSERT(strstr(srv.last_request, "\"type\":\"noul\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(srv.last_request, "Shell command:\\ntouch ") != NULL);
+    free(res);
+
+    /* Below the threshold the gate stays out of the way. */
+    srv.noul = "0.10";
+    AGENT_TEST_ASSERT(agent_d1_bash_gate(&w, cmd, err, sizeof(err)));
+
+    /* Interactive: risky commands go through the approval prompt. */
+    srv.noul = "0.93";
+    cfg.non_interactive = false;
+    test_d1_approver approver = {.w = &w, .allow = false};
+    pthread_t approver_thread;
+    pthread_create(&approver_thread, NULL, test_d1_approver_main, &approver);
+    AGENT_TEST_ASSERT(!agent_d1_bash_gate(&w, cmd, err, sizeof(err)));
+    pthread_join(approver_thread, NULL);
+    AGENT_TEST_ASSERT(strstr(approver.seen, "p=0.93") != NULL);
+    AGENT_TEST_ASSERT(!strcmp(err, "user denied risky bash command"));
+    approver = (test_d1_approver){.w = &w, .allow = true};
+    pthread_create(&approver_thread, NULL, test_d1_approver_main, &approver);
+    AGENT_TEST_ASSERT(agent_d1_bash_gate(&w, cmd, err, sizeof(err)));
+    pthread_join(approver_thread, NULL);
+    AGENT_TEST_ASSERT(srv.served == 4);
+
+    /* Unreachable server: fail open and report it once. */
+    pthread_join(server_thread, NULL);
+    close(srv.listen_fd);
+    unlink(sock);
+    cfg.non_interactive = true;
+    AGENT_TEST_ASSERT(agent_d1_bash_gate(&w, cmd, err, sizeof(err)));
+    AGENT_TEST_ASSERT(w.d1_unavailable_reported);
+
+    agent_tool_call_free(&call);
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    free(w.out);
+    rmdir(dir);
+}
+
 /* Model-backed regression: save an unsynchronizable transcript, then rebuild
  * it in a larger context using the normal stripped-session loader. */
 static int test_full_context_save(const char *model) {
@@ -1033,6 +1168,7 @@ int main(int argc, char **argv) {
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();
+    test_d1_bash_gate();
     if (agent_test_failures) {
         fprintf(stderr, "ds4-agent tests: %d failure(s)\n",
                 agent_test_failures);
