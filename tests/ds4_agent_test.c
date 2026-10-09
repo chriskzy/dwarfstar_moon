@@ -1020,6 +1020,7 @@ static void test_d1_bash_gate(void) {
     pthread_mutex_init(&w.mu, NULL);
     pthread_cond_init(&w.cond, NULL);
     AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    w.trace = tmpfile();
 
     /* Risky and non-interactive: the command must not run. */
     agent_tool_call call = {.name = xstrdup("bash")};
@@ -1030,6 +1031,13 @@ static void test_d1_bash_gate(void) {
     AGENT_TEST_ASSERT(strstr(srv.last_request, "\"type\":\"noul\"") != NULL);
     AGENT_TEST_ASSERT(strstr(srv.last_request, "Shell command:\\ntouch ") != NULL);
     free(res);
+    /* The trace records the command and the gate's verdict and latency, which
+     * speed-bench/d1_gate_eval replays. */
+    char trace[4096] = {0};
+    rewind(w.trace);
+    trace[fread(trace, 1, sizeof(trace) - 1, w.trace)] = '\0';
+    AGENT_TEST_ASSERT(strstr(trace, " bash-command=\"touch ") != NULL);
+    AGENT_TEST_ASSERT(strstr(trace, "d1 gate: p=0.9300 threshold=0.50 ms=") != NULL);
 
     /* Below the threshold the gate stays out of the way. */
     srv.noul = "0.10";
@@ -1060,6 +1068,7 @@ static void test_d1_bash_gate(void) {
     AGENT_TEST_ASSERT(w.d1_unavailable_reported);
 
     agent_tool_call_free(&call);
+    fclose(w.trace);
     close(w.wake_fd[0]);
     close(w.wake_fd[1]);
     free(w.out);

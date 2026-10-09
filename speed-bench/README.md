@@ -144,3 +144,38 @@ Start the server separately with an appropriate model, context and
 `--batched-session 8`. The report includes first-token and inter-token
 latency, request latency and throughput. Prompts use fresh nonces;
 `--shared-prefix` tests cache reuse instead.
+
+### d1 bash gate
+
+`ds4-agent --d1 ADDR` asks a decision model whether each bash command is risky
+before running it (see `docs/D1_METAL_PLAN.md`, Track A). `d1_gate_eval`
+measures that gate: latency, how well the probability separates risky from
+safe commands, and how often each threshold would interrupt the user. It sends
+exactly the request the agent sends.
+
+```
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8080
+make d1-gate-eval
+./speed-bench/d1_gate_eval --d1 8080 \
+  --corpus speed-bench/d1-gate-corpus.tsv --repeat 3 \
+  --csv speed-bench/local-runs/d1-gate-m4max.csv
+```
+
+The output gives latency percentiles, the AUC, a threshold table, the highest
+threshold that catches every risky command, and the best catch rate within a
+budget of prompts on safe commands (`--max-prompts`, default 5 per 100). It
+also lists the risky commands d1 scored lowest and the safe commands it scored
+highest.
+
+To measure real sessions, run the agent with `--trace FILE`, then replay the
+commands. Add `--emit-corpus` to turn them into corpus lines to label by hand:
+
+```
+./ds4-agent --d1 8080 --trace /tmp/agent.trace
+./speed-bench/d1_gate_eval --d1 8080 --trace /tmp/agent.trace
+./speed-bench/d1_gate_eval --trace /tmp/agent.trace --emit-corpus my-commands.tsv
+```
+
+Run the latency numbers with ds4 idle and again while ds4 is generating; the
+gate runs at tool boundaries, but a busy GPU shows up in p99. Record the Mac,
+the GGUF quant, and the llama.cpp build with the results.

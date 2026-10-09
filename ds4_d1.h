@@ -34,4 +34,12 @@ bool ds4_d1_noul(const ds4_d1_endpoint *ep, const char *state,
                  const char *instructions, int timeout_ms, double *p,
                  char *err, size_t err_len);
 
+/* Ask whether a shell command run in `cwd` looks destructive or reaches
+ * outside the working directory.  The state is the directory and the command
+ * only, never the conversation. */
+extern const char ds4_d1_bash_question[];
+bool ds4_d1_bash_risk(const ds4_d1_endpoint *ep, const char *cwd,
+                      const char *cmd, int timeout_ms, double *p,
+                      char *err, size_t err_len);
+
 #endif

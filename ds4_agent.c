@@ -9486,36 +9486,20 @@ static void agent_tool_view_image(agent_worker *w,
  * be worse than not configuring it. */
 #define AGENT_D1_TIMEOUT_MS 2000
 
-static const char agent_d1_bash_question[] =
-    "Could running this shell command cause irreversible damage or reach outside "
-    "the working directory, for example by deleting or overwriting data, "
-    "rewriting git history, changing system configuration, or sending files or "
-    "secrets over the network?";
-
-static char *agent_d1_bash_state(const char *cmd) {
-    char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "(unknown)");
-    agent_buf b = {0};
-    agent_buf_puts(&b, "Working directory: ");
-    agent_buf_puts(&b, cwd);
-    agent_buf_puts(&b, "\nShell command:\n");
-    agent_buf_puts(&b, cmd);
-    agent_buf_puts(&b, "\n");
-    return agent_buf_take(&b);
-}
-
 /* Returns true when the command may run; otherwise err explains why not. */
 static bool agent_d1_bash_gate(agent_worker *w, const char *cmd,
                                char *err, size_t err_len) {
     if (!w->cfg->d1_enabled) return true;
-    char *state = agent_d1_bash_state(cmd);
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
     char d1_err[256] = {0};
     double p = 0;
-    bool asked = ds4_d1_noul(&w->cfg->d1, state, agent_d1_bash_question,
-                             AGENT_D1_TIMEOUT_MS, &p, d1_err, sizeof(d1_err));
-    free(state);
+    const double t0 = now_sec();
+    bool asked = ds4_d1_bash_risk(&w->cfg->d1, cwd, cmd, AGENT_D1_TIMEOUT_MS,
+                                  &p, d1_err, sizeof(d1_err));
+    const double ms = (now_sec() - t0) * 1000.0;
     if (!asked) {
-        agent_trace(w, "d1 gate: unavailable: %s", d1_err);
+        agent_trace(w, "d1 gate: unavailable after %.1f ms: %s", ms, d1_err);
         if (!w->d1_unavailable_reported) {
             agent_publishf_system_status(w,
                 "d1 gate unavailable (%s); bash commands run unchecked", d1_err);
@@ -9524,7 +9508,8 @@ static bool agent_d1_bash_gate(agent_worker *w, const char *cmd,
         return true;
     }
     w->d1_unavailable_reported = false;
-    agent_trace(w, "d1 gate: p=%.4f threshold=%.2f", p, w->cfg->d1_threshold);
+    agent_trace(w, "d1 gate: p=%.4f threshold=%.2f ms=%.1f",
+                p, w->cfg->d1_threshold, ms);
     if (p < w->cfg->d1_threshold) return true;
 
     if (w->cfg->non_interactive) {
@@ -9560,6 +9545,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
+        /* speed-bench/d1_gate_eval replays these lines to measure the gate on
+         * real sessions. */
+        agent_trace_text(w, "bash-command", cmd, strlen(cmd));
         char gate_err[256] = {0};
         if (!agent_d1_bash_gate(w, cmd, gate_err, sizeof(gate_err))) {
             agent_buf_puts(&result, "Tool error: bash command not run: ");

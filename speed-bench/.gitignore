@@ -4,3 +4,4 @@ local-runs/
 metal_decode_schedule_bench
 metal_prefill_variant_bench
 session_concurrency_bench
+d1_gate_eval
