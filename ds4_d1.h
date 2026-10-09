@@ -34,11 +34,20 @@ bool ds4_d1_noul(const ds4_d1_endpoint *ep, const char *state,
                  const char *instructions, int timeout_ms, double *p,
                  char *err, size_t err_len);
 
+/* Ask several yes/no questions about one state in a single request; p[i]
+ * receives the probability for names[i]. */
+bool ds4_d1_noul_set(const ds4_d1_endpoint *ep, const char *state, int n,
+                     const char *const *names, const char *const *instructions,
+                     int timeout_ms, double *p, char *err, size_t err_len);
+
 /* Ask whether a shell command run in `cwd` looks destructive or reaches
- * outside the working directory.  The state is the directory and the command
- * only, never the conversation. */
-extern const char ds4_d1_bash_question[];
-bool ds4_d1_bash_risk(const ds4_d1_endpoint *ep, const char *cwd,
+ * outside the working directory, as the probability that it is risky.  The
+ * state is the directory and the command only, never the conversation.
+ * `variant` (1..ds4_d1_bash_variants) selects the question wording; see
+ * ds4_d1.c for what each one asks and how it measured. */
+#define DS4_D1_BASH_DEFAULT_VARIANT 1
+extern const int ds4_d1_bash_variants;
+bool ds4_d1_bash_risk(const ds4_d1_endpoint *ep, int variant, const char *cwd,
                       const char *cmd, int timeout_ms, double *p,
                       char *err, size_t err_len);
 

@@ -9495,7 +9495,8 @@ static bool agent_d1_bash_gate(agent_worker *w, const char *cmd,
     char d1_err[256] = {0};
     double p = 0;
     const double t0 = now_sec();
-    bool asked = ds4_d1_bash_risk(&w->cfg->d1, cwd, cmd, AGENT_D1_TIMEOUT_MS,
+    bool asked = ds4_d1_bash_risk(&w->cfg->d1, DS4_D1_BASH_DEFAULT_VARIANT,
+                                  cwd, cmd, AGENT_D1_TIMEOUT_MS,
                                   &p, d1_err, sizeof(d1_err));
     const double ms = (now_sec() - t0) * 1000.0;
     if (!asked) {

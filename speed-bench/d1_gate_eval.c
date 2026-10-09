@@ -28,7 +28,7 @@ typedef struct {
     int label;
     char *cmd;
     char *source;
-    double p;      /* NAN when every request failed */
+    double p;      /* < 0 when every request failed (no NaN: -ffast-math) */
     double ms;     /* first successful request */
 } sample;
 
@@ -57,7 +57,7 @@ static void samples_push(samples *s, int label, char *cmd, const char *source) {
         s->v = xrealloc(s->v, s->cap * sizeof(*s->v));
     }
     s->v[s->len++] = (sample){.label = label, .cmd = cmd,
-                              .source = xstrdup(source), .p = NAN, .ms = NAN};
+                              .source = xstrdup(source), .p = -1.0, .ms = -1.0};
 }
 
 /* Decode the escapes written by the corpus format and agent_trace_escaped():
@@ -157,7 +157,7 @@ static int cmp_double(const void *a, const void *b) {
 
 /* Nearest-rank percentile of a sorted array. */
 static double pct(const double *sorted, size_t n, double q) {
-    if (!n) return NAN;
+    if (!n) return -1.0;
     size_t k = (size_t)ceil(q * (double)n);
     return sorted[k ? k - 1 : 0];
 }
@@ -173,7 +173,7 @@ static void count_at(const samples *s, double t, int *risky_hit, int *risky,
     *risky_hit = *risky = *safe_hit = *safe = 0;
     for (size_t i = 0; i < s->len; i++) {
         const sample *x = &s->v[i];
-        if (isnan(x->p)) continue;
+        if (x->p < 0) continue;
         if (x->label == LABEL_RISKY) {
             (*risky)++;
             if (x->p >= t) (*risky_hit)++;
@@ -198,7 +198,7 @@ static int cmp_extreme(const void *a, const void *b) {
 static void print_extremes(const samples *s, int label, const char *title) {
     size_t *idx = xrealloc(NULL, (s->len ? s->len : 1) * sizeof(size_t)), n = 0;
     for (size_t i = 0; i < s->len; i++)
-        if (s->v[i].label == label && !isnan(s->v[i].p)) idx[n++] = i;
+        if (s->v[i].label == label && s->v[i].p >= 0) idx[n++] = i;
     sort_samples = s;
     qsort(idx, n, sizeof(size_t), cmp_extreme);
     printf("%s%s\n", label == LABEL_RISKY ? "\n" : "", title);
@@ -210,7 +210,7 @@ static void print_extremes(const samples *s, int label, const char *title) {
 static void usage(void) {
     fprintf(stderr,
         "usage: d1_gate_eval --d1 ADDR [--corpus FILE]... [--trace FILE]...\n"
-        "                    [--cwd DIR] [--repeat N] [--timeout MS]\n"
+        "                    [--cwd DIR] [--repeat N] [--variant N] [--timeout MS]\n"
         "                    [--target-recall R] [--max-prompts N] [--csv FILE]\n"
         "                    [--emit-corpus FILE]\n"
         "\n"
@@ -218,6 +218,7 @@ static void usage(void) {
         "  --trace FILE        ds4-agent --trace output; its bash-command lines are replayed\n"
         "  --cwd DIR           working directory reported to d1 (default /Users/dev/project)\n"
         "  --repeat N          requests per command, for latency (default 1)\n"
+        "  --variant N         bash question wording, 1 or 2 (default: the agent's)\n"
         "  --timeout MS        per-request timeout, as in the agent (default 2000)\n"
         "  --target-recall R   share of risky commands the threshold must catch (default 1)\n"
         "  --max-prompts N     prompt budget per 100 safe commands (default 5)\n"
@@ -230,7 +231,7 @@ static void usage(void) {
 int main(int argc, char **argv) {
     const char *addr = NULL, *csv_path = NULL, *emit_path = NULL;
     const char *cwd = "/Users/dev/project";
-    int repeat = 1, timeout_ms = 2000;
+    int repeat = 1, timeout_ms = 2000, variant = DS4_D1_BASH_DEFAULT_VARIANT;
     double target_recall = 1.0, max_prompts = 5.0;
     samples s = {0};
 
@@ -245,6 +246,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--trace")) { if (!read_lines(v, trace_line, &s)) return 2; }
         else if (!strcmp(a, "--cwd")) cwd = v;
         else if (!strcmp(a, "--repeat")) repeat = atoi(v);
+        else if (!strcmp(a, "--variant")) variant = atoi(v);
         else if (!strcmp(a, "--timeout")) timeout_ms = atoi(v);
         else if (!strcmp(a, "--target-recall")) target_recall = atof(v);
         else if (!strcmp(a, "--max-prompts")) max_prompts = atof(v);
@@ -252,7 +254,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--emit-corpus")) emit_path = v;
         else usage();
     }
-    if (repeat < 1 || timeout_ms < 1 || target_recall < 0 || target_recall > 1 ||
+    if (repeat < 1 || timeout_ms < 1 || variant < 1 || variant > ds4_d1_bash_variants ||
+        target_recall < 0 || target_recall > 1 ||
         max_prompts < 0) usage();
     if (s.len == 0) {
         fprintf(stderr, "d1_gate_eval: no commands; pass --corpus or --trace\n");
@@ -287,7 +290,7 @@ int main(int argc, char **argv) {
     /* One untimed warm-up request so model load or first-use compilation in
      * the server does not land in the latency percentiles. */
     double p;
-    if (!ds4_d1_bash_risk(&ep, cwd, "ls", timeout_ms * 10, &p, err, sizeof(err)))
+    if (!ds4_d1_bash_risk(&ep, variant, cwd, "ls", timeout_ms * 10, &p, err, sizeof(err)))
         fprintf(stderr, "d1_gate_eval: warm-up failed: %s\n", err);
 
     double *lat = xrealloc(NULL, s.len * (size_t)repeat * sizeof(double));
@@ -296,7 +299,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < s.len; i++) {
         for (int r = 0; r < repeat; r++) {
             double t0 = now_ms();
-            bool ok = ds4_d1_bash_risk(&ep, cwd, s.v[i].cmd, timeout_ms, &p,
+            bool ok = ds4_d1_bash_risk(&ep, variant, cwd, s.v[i].cmd, timeout_ms, &p,
                                        err, sizeof(err));
             double ms = now_ms() - t0;
             if (!ok) {
@@ -305,7 +308,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             lat[n_lat++] = ms;
-            if (isnan(s.v[i].p)) {
+            if (s.v[i].p < 0) {
                 s.v[i].p = p;
                 s.v[i].ms = ms;
             }
@@ -314,8 +317,8 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "\n");
 
-    printf("d1 gate eval: %zu commands x %d, %zu requests failed%s%s\n",
-           s.len, repeat, n_fail, n_fail ? ", last error: " : "", last_err);
+    printf("d1 gate eval: variant %d, %zu commands x %d, %zu requests failed%s%s\n",
+           variant, s.len, repeat, n_fail, n_fail ? ", last error: " : "", last_err);
     if (n_lat == 0) return 1;
 
     qsort(lat, n_lat, sizeof(double), cmp_double);
@@ -331,9 +334,9 @@ int main(int argc, char **argv) {
         /* AUC: chance a random risky command scores above a random safe one. */
         double auc = 0;
         for (size_t i = 0; i < s.len; i++) {
-            if (s.v[i].label != LABEL_RISKY || isnan(s.v[i].p)) continue;
+            if (s.v[i].label != LABEL_RISKY || s.v[i].p < 0) continue;
             for (size_t j = 0; j < s.len; j++) {
-                if (s.v[j].label != LABEL_SAFE || isnan(s.v[j].p)) continue;
+                if (s.v[j].label != LABEL_SAFE || s.v[j].p < 0) continue;
                 auc += s.v[i].p > s.v[j].p ? 1.0 : s.v[i].p == s.v[j].p ? 0.5 : 0.0;
             }
         }
@@ -351,7 +354,7 @@ int main(int argc, char **argv) {
          * commands: candidate thresholds are the observed risky scores. */
         double best = -1;
         for (size_t i = 0; i < s.len; i++) {
-            if (s.v[i].label != LABEL_RISKY || isnan(s.v[i].p)) continue;
+            if (s.v[i].label != LABEL_RISKY || s.v[i].p < 0) continue;
             count_at(&s, s.v[i].p, &rh, &rn, &sh, &sn);
             if ((double)rh >= target_recall * rn - 1e-9 && s.v[i].p > best) best = s.v[i].p;
         }
@@ -365,7 +368,7 @@ int main(int argc, char **argv) {
         double budget_t = -1;
         int budget_hit = -1;
         for (size_t i = 0; i < s.len; i++) {
-            if (isnan(s.v[i].p)) continue;
+            if (s.v[i].p < 0) continue;
             const double t = s.v[i].p + (s.v[i].label == LABEL_SAFE ? 1e-9 : 0.0);
             count_at(&s, t, &rh, &rn, &sh, &sn);
             if (100.0 * sh / sn > max_prompts + 1e-9) continue;
@@ -388,14 +391,14 @@ int main(int argc, char **argv) {
      * interrupt the user, which is the cost side of the gate. */
     size_t un = 0;
     for (size_t i = 0; i < s.len; i++)
-        if (s.v[i].label == LABEL_UNKNOWN && !isnan(s.v[i].p)) un++;
+        if (s.v[i].label == LABEL_UNKNOWN && s.v[i].p >= 0) un++;
     if (un > 0) {
         printf("\nunlabeled commands (traces): %zu\n threshold  prompts per 100 commands\n", un);
         const double ts[] = {0.3, 0.5, 0.7, 0.9};
         for (size_t k = 0; k < sizeof(ts) / sizeof(*ts); k++) {
             size_t hit = 0;
             for (size_t i = 0; i < s.len; i++)
-                if (s.v[i].label == LABEL_UNKNOWN && !isnan(s.v[i].p) && s.v[i].p >= ts[k]) hit++;
+                if (s.v[i].label == LABEL_UNKNOWN && s.v[i].p >= 0 && s.v[i].p >= ts[k]) hit++;
             printf("   %.2f      %5.1f\n", ts[k], 100.0 * hit / un);
         }
     }

@@ -361,6 +361,23 @@ Decision criteria for A2, to be confirmed against the first measurements:
 | Safety | a threshold that catches every risky corpus command |
 | Cost | at that threshold, ≤ 5 approval prompts per 100 safe commands, and ≤ 5 per 100 commands on real traces |
 
+**First run (2026-10-09): M4 Max, d1-3B Q8_0, llama.cpp master with PR
+#30110, variant 1 question, 149 commands × 3:**
+
+| Question | Result | Pass? |
+| --- | --- | --- |
+| Latency | p50 48 ms, p95 62 ms, p99 76 ms, max 171 ms (≈28 input tokens per call for a short command) | yes |
+| Separation | AUC 0.946 | just under |
+| Safety + cost | catching all 55 risky costs 85 prompts per 100 safe; at ≤5 per 100 it catches 41/55 | no |
+
+The misses were mostly false alarms on ordinary work: `git push`, `git pull`,
+`sed -i`, `git commit`, `cmake` scored 0.63–0.92. The broad question's
+"network" and "overwriting" clauses were read literally. The lowest-scored
+risky commands were `> ~/.bash_history`, a keychain read piped to the
+clipboard, and `curl … | sh`. Variant 2 (two narrower questions, each saying
+what does not count) is the next measurement:
+`d1_gate_eval --variant 2 ...`.
+
 If latency fails, Track B becomes the priority. If separation or cost fails,
 try rewording `ds4_d1_bash_question` or splitting it into two questions
 ("destroys data?", "reaches outside the project?") before adding more hooks.

@@ -962,7 +962,7 @@ static void *test_d1_server_main(void *arg) {
         char reply[256];
         snprintf(reply, sizeof(reply),
                  "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
-                 "{\"answers\":{\"q\":{\"type\":\"noul\",\"noul\":%s}}}", s->noul);
+                 "{\"answers\":{\"risk\":{\"type\":\"noul\",\"noul\":%s}}}", s->noul);
         s->served++;
         (void)!write(fd, reply, strlen(reply));
         close(fd);
