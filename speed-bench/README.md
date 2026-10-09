@@ -154,9 +154,9 @@ safe commands, and how often each threshold would interrupt the user. It sends
 exactly the request the agent sends.
 
 ```
-llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8080
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8091
 make d1-gate-eval
-./speed-bench/d1_gate_eval --d1 8080 \
+./speed-bench/d1_gate_eval --d1 8091 \
   --corpus speed-bench/d1-gate-corpus.tsv --repeat 3 \
   --csv speed-bench/local-runs/d1-gate-m4max.csv
 ```
@@ -171,8 +171,8 @@ To measure real sessions, run the agent with `--trace FILE`, then replay the
 commands. Add `--emit-corpus` to turn them into corpus lines to label by hand:
 
 ```
-./ds4-agent --d1 8080 --trace /tmp/agent.trace
-./speed-bench/d1_gate_eval --d1 8080 --trace /tmp/agent.trace
+./ds4-agent --d1 8091 --trace /tmp/agent.trace
+./speed-bench/d1_gate_eval --d1 8091 --trace /tmp/agent.trace
 ./speed-bench/d1_gate_eval --trace /tmp/agent.trace --emit-corpus my-commands.tsv
 ```
 

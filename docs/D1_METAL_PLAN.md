@@ -331,8 +331,8 @@ server is unreachable the gate fails open and says so once. Tests:
 `tests/test_d1_client` and `test_d1_bash_gate` in `ds4_agent_test`.
 
 ```sh
-llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8080
-./ds4-agent --d1 8080
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0 --port 8091
+./ds4-agent --d1 8091
 ```
 
 - **A1.** Add `ds4_d1_client.c`, `--d1 ADDR`, one harness hook (the pre-tool
